@@ -1,0 +1,181 @@
+---
+title: "Analysis Pt. 2"
+output: html_document
+date: "2024-10-07"
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(dplyr)
+library(readr)
+library("ggplot2")
+library("ggpubr")
+library(powerjoin)
+library("irr")
+library(FSA)
+library(ggstatsplot)
+library(knitr)
+library(reticulate)
+
+# INITIALIZE DATA
+pairs <- read.csv("pair-data.csv", stringsAsFactors = FALSE)
+names(pairs) <- c("category", "pair_id", "pair_level", "video1", "video1_level", "video2", "video2_level")
+
+videos <- read.csv("video-data.csv", stringsAsFactors = FALSE)
+names(videos) <- c("category", "comment_count", "create_time", "id", "like_count", "share_count", "username", "video_description", "view_count")
+  
+quiz_data <- read.csv("quiz_results.csv", stringsAsFactors = FALSE, header = FALSE)
+names(quiz_data) <- c("user_id", "pair_id", "timestamp", "video1", "video2", "preference", "popular_vid")
+quiz_data <- quiz_data[quiz_data$user_id > 50, ]
+
+survey <- read.csv("survey_results.csv", stringsAsFactors = FALSE, header = FALSE)
+names(survey) <- c("user_id", "timestamp", "q1", "q2", "q3", "q4", "q5", "q6", "q7")
+
+# MERGE TABLES FOR INFO ACCESS & CLEAN DATA
+names(videos) <- c("category", "comment_count", "create_time", "video1_id", "like_count_v1", "share_count", "username", "video_description", "view_count_v1")
+quiz <- power_full_join(quiz_data, videos[ , c("video1_id", "like_count_v1", "view_count_v1")], by = join_by(video1 == video1_id), conflict = coalesce_xy)
+names(videos) <- c("category", "comment_count", "create_time", "video2_id", "like_count_v2", "share_count", "username", "video_description", "view_count_v2")
+quiz <- power_full_join(quiz, videos[ , c("video2_id", "like_count_v2", "view_count_v2")], by = join_by(video2 == video2_id), conflict = coalesce_xy)
+names(videos) <- c("category", "comment_count", "create_time", "id", "like_count", "share_count", "username", "video_description", "view_count")
+
+quiz <- power_full_join(quiz, pairs, by = join_by(pair_id == pair_id), conflict = coalesce_xy)
+
+quiz$pair_level <- case_when(
+  quiz$pair_level == "viral-high" ~ "V-H",
+  quiz$pair_level == "viral-medium" ~ "V-M",
+  quiz$pair_level == "viral-low" ~ "V-L",
+  quiz$pair_level == "viral-very_low" ~ "V-VL",
+  quiz$pair_level == "high-medium" ~ "H-M",
+  quiz$pair_level == "high-low" ~ "H-L",
+  quiz$pair_level == "high-very_low" ~ "H-VL",
+  quiz$pair_level == "medium-low" ~ "M-L",
+  quiz$pair_level == "medium-very_low" ~ "M-VL",
+  quiz$pair_level == "low-very_low" ~ "L-VL",
+)
+
+# CORRECT COUNT COLUMN
+quiz <- quiz %>%
+  mutate(correct=case_when(
+    popular_vid=="correct" ~ 1,
+    popular_vid=="wrong" ~ 0
+  ))
+
+quiz <- quiz %>%
+  mutate(more_popular=case_when(
+    view_count_v1 > view_count_v2 ~ video1,
+    view_count_v2 > view_count_v1 ~ video2,
+  )) %>%
+  mutate(pref_popular=case_when(
+    preference == more_popular ~ 1,
+    preference != more_popular ~ 0,
+  )) %>%
+  mutate(less_popular=case_when(
+    view_count_v1 > view_count_v2 ~ video2,
+    view_count_v2 > view_count_v1 ~ video1,
+  ))
+
+quiz <- na.omit(quiz)
+
+quiz_by_pairs <- quiz %>% group_by(pair_level, pair_id) %>%
+  reframe(
+    sum_correct = sum(correct), 
+    sum_pref = sum(pref_popular),
+    view_diff = abs(mean(view_count_v1) - mean(view_count_v2)),
+    count = n(),
+    correct_ratio = sum_correct/count,
+    pref_ratio = sum_pref/count
+  ) %>%
+  filter(count > 2)
+
+quiz_by_level <- group_by(quiz, pair_level) %>%
+  reframe(
+    sum_correct = sum(correct), 
+    sum_pref = sum(pref_popular),
+    view_diff = abs(mean(view_count_v1) - mean(view_count_v2)),
+    count = n(),
+    correct_ratio = sum_correct/count,
+    pref_ratio = sum_pref/count
+  ) 
+```
+
+## How good is the TikTok algorithm?
+
+i.e. how often is the video with more views/likes the video that participants actually preferred?
+
+The x-axis is the various pair levels, the y-axis is the average value of how often the TikTok algorithm agrees with the user preference.
+
+At all pair levels, besides the Low to Very-Low category, the algorithm is at least as good as a random guess. When one video is viral, the
+chance of the algorithm being correct is over 60%.
+
+```{r cars}
+pref_grouping <- quiz_by_pairs %>% group_by(pair_level) %>%
+  reframe(
+    sum_prefs = sum(pref_ratio),
+    count = n(),
+    avg_pref = sum_prefs/count,
+    view_dif_avg = mean(view_diff)
+  )
+
+ggplot(data = pref_grouping) +
+  geom_point(mapping = aes(x = pair_level, y = avg_pref))
+
+ggline(pref_grouping, x = "pair_level", y = "avg_pref", 
+       ylab = "Preference Alignment", xlab = "Pair Level") + stat_compare_means()
+
+ggline(quiz_by_pairs, x = "pair_level", y = "pref_ratio", 
+       add = c("mean_se", "jitter"), 
+       ylab = "Ratio Correct", xlab = "Pair Level") + stat_compare_means()
+```
+
+## How accurate are participant's prediction of the algorithm?
+
+i.e. how often did the participants correctly guess the more popular video?
+
+First graph shows the pair levels vs. the correct ratio (how often the participant correctly guessed which video was more popular)
+Each point represents an individual pair.
+
+The second graph plots the same data, however using the data grouped by the level and not by pair. I'm unsure why the values in the two graphs do not align.
+
+```{r pressure, echo=FALSE}
+ggline(quiz_by_pairs, x = "pair_level", y = "correct_ratio", 
+       add = c("mean_se", "jitter"), 
+       ylab = "Ratio Correct", xlab = "Pair Level") + stat_compare_means()
+
+ggline(quiz_by_level, x = "pair_level", y = "correct_ratio", 
+       ylab = "Ratio Correct", xlab = "Pair Level") + stat_compare_means()
+```
+
+# RQ2: Which video performs the best in all pairwise matchings?
+
+Transforming data format for survey equivalence analysis
+
+``` {r}
+survey_equiv <- quiz %>%
+  mutate(selected=case_when(
+    popular_vid=="correct" ~ more_popular,
+    popular_vid=="wrong" ~ less_popular
+  )) %>% group_by(pair_level, pair_id, more_popular) %>%
+  summarise(
+    selected = list(selected),
+    preference = list(preference)
+  )
+
+survey_equiv <- survey_equiv %>% unnest_wider(selected, names_sep = "_") %>%
+  unnest_wider(preference, names_sep = "_")
+```
+
+``` {python}
+import numpy
+import surveyequivalence
+
+plurality_combiner = PluralityVote(allowable_labels=['pos', 'neg'])
+agreement_score = AgreementScore()
+pipeline = AnalysisPipeline(r.survey_equiv,
+                            expert_cols=c("selected_1", "selected_2", "selected_3", "selected_4", "selected_5"),
+                            classifier_predictions= r.survey_equiv.more_popular,
+                            combiner=plurality_combiner,
+                            scorer=agreement_score,
+                            allowable_labels=['pos', 'neg'],
+                            num_bootstrap_item_samples=num_bootstrap_item_samples,
+                            verbosity = 1)
+```
